@@ -1,11 +1,14 @@
 <?php
-namespace FOC\Authenticate\Auth;
+namespace Users\Auth;
 
 use Cake\Auth\BaseAuthenticate;
 use Cake\Controller\ComponentRegistry;
 use Cake\Controller\Component\CookieComponent;
+use Cake\Event\Event;
+use Cake\I18n\Time;
 use Cake\Network\Request;
 use Cake\Network\Response;
+use Cake\ORM\TableRegistry;
 use Cake\Routing\Router;
 
 /**
@@ -13,40 +16,52 @@ use Cake\Routing\Router;
  *
  * Provides the ability to authenticate using COOKIE
  *
- * {{{
- *  $this->Auth->config('authenticate', [
- *      'Authenticate.Cookie' => [
- *          'fields' => [
- *              'username' => 'username',
- *              'password' => 'password'
- *          ],
- *          'ephemeral' => [
- *              'created' => 'token_created'
- *          ],
- *          'userModel' => 'Users',
- *          'scope' => ['Users.active' => 1],
- *          'crypt' => 'aes',
- *          'cookie' => [
- *              'name' => 'RememberMe',
- *              'time' => '+2 weeks',
- *          ]
- *      ]
- *  ]);
- * }}}
+ * ```
+ *    $this->Auth->config('authenticate', [
+ *        'Authenticate.Cookie' => [
+ *            'fields' => [
+ *                'username' => 'username',
+ *                'password' => 'password'
+ *             ],
+ *            'tokenCreated' => false,
+ *            'userModel' => 'Users',
+ *            'scope' => ['Users.active' => 1],
+ *            'crypt' => 'aes',
+ *            'cookie' => [
+ *                'name' => 'RememberMe',
+ *                'time' => '+2 weeks',
+ *            ]
+ *        ]
+ *    ]);
+ * ```
  *
  * Licensed under The MIT License
  * For full copyright and license information, please see the LICENSE.txt
  */
-class CookieAuthenticate extends BaseAuthenticate {
+class CookieAuthenticate extends BaseAuthenticate
+{
 
-/**
- * Constructor
- *
- * @param \Cake\Controller\ComponentRegistry $registry The Component registry
- *   used on this request.
- * @param array $config Array of config to use.
- */
-    public function __construct(ComponentRegistry $registry, $config) {
+    /**
+     * Events supported by this class.
+     *
+     * @return array
+     */
+    public function implementedEvents()
+    {
+        return [
+            'Auth.logout' => 'logout',
+        ];
+    }
+
+    /**
+     * Constructor
+     *
+     * @param \Cake\Controller\ComponentRegistry $registry The Component registry
+     *   used on this request.
+     * @param array $config Array of config to use.
+     */
+    public function __construct(ComponentRegistry $registry, $config)
+    {
         $this->_registry = $registry;
 
         $this->config([
@@ -54,27 +69,27 @@ class CookieAuthenticate extends BaseAuthenticate {
                 'name' => 'RememberMe',
                 'expires' => '+2 weeks'
             ],
-            'ephemeral' => false,
             'crypt' => 'aes'
         ]);
 
         $this->config($config);
     }
 
-/**
- * Authenticates the identity contained in the cookie.  Will use the
- * `userModel` config, and `fields` config to find COOKIE data that is used
- * to find a matching record in the model specified by `userModel`. Will return
- * false if there is no cookie data, either username or password is missing,
- * or if the scope conditions have not been met.
- *
- * @param Request $request The unused request object
- * @return mixed False on login failure. An array of User data on success.
- * @throws \RuntimeException
- */
-    public function getUser(Request $request) {
+    /**
+     * Authenticates the identity contained in the cookie.  Will use the
+     * `userModel` config, and `fields` config to find COOKIE data that is used
+     * to find a matching record in the model specified by `userModel`. Will return
+     * false if there is no cookie data, either username or password is missing,
+     * or if the scope conditions have not been met.
+     *
+     * @param Request $request The unused request object.
+     * @return mixed False on login failure. An array of User data on success.
+     * @throws \RuntimeException If CookieComponent is not loaded.
+     */
+    public function getUser(Request $request)
+    {
         if (!isset($this->_registry->Cookie) ||
-            !$this->_registry->Cookie instanceof CookieComponent
+        !$this->_registry->Cookie instanceof CookieComponent
         ) {
             throw new \RuntimeException('CookieComponent is not loaded');
         }
@@ -94,13 +109,7 @@ class CookieAuthenticate extends BaseAuthenticate {
             return false;
         }
 
-        $ephemeral = $this->_config['ephemeral'];
-        if ($ephemeral) {
-            $user = $this->_findUserByToken($data[$username], $data[$password]);
-        } else {
-            $user = $this->_findUser($data[$username], $data[$password]);
-        }
-
+        $user = $this->_findUserWithExpiration($data[$username], $data[$password]);
         if ($user) {
             $request->session()->write(
                 $this->_registry->Auth->sessionKey,
@@ -112,36 +121,21 @@ class CookieAuthenticate extends BaseAuthenticate {
         return false;
     }
 
-/**
- * Authenticate user
- *
- * @param Request $request Request object.
- * @param Response $response Response object.
- * @return array|bool Array of user info on success, false on falure.
- */
-    public function authenticate(Request $request, Response $response) {
-        return $this->getUser($request);
-    }
-
-/**
- * Find a user using the username field and an ephemeral token.
- *
- * This is very similar to \Cake\Auth\BaseAuthenticate::_findUser()
- * but it checks the expiration of a corresponding created field.
- *
- * It also nulls the token field if the expiration has passed.
- *
- * @param string $username The identifier.
- * @param string $token The ephemeral token which is checked against it's 
- * hash just like a password field.
- */
-    protected function _findUserByToken($username, $token)
+    /**
+     * This is identical to BaseAuthenticate::_findUser() but it also
+     * checks the timestamp of an optional tokenCreated field if supplied
+     * in the configuration.  This is a fallback in case a cookie is
+     * spoofed.
+     *
+     * @param string $username The username/identifier.
+     * @prarm string|null The password/token.  If not provided, password
+     * chceking is skipped.
+     */
+    public function _findUserWithExpiration($username, $password = null)
     {
         $userModel = $this->_config['userModel'];
         list(, $model) = pluginSplit($userModel);
         $fields = $this->_config['fields'];
-        $expiration = $this->config('cookie.expires');
-        $tokenCreated = $this->config('ephemeral.created');
 
         $conditions = [$model . '.' . $fields['username'] => $username];
 
@@ -161,27 +155,52 @@ class CookieAuthenticate extends BaseAuthenticate {
             ->where($conditions)
             ->first();
 
-        if ($result[$tokenCreated]->wasWithinLast($expiration)) {
-            $hasher = $this->passwordHasher();
-            if ($hasher->check($token, $result->token)) {
-                return $result->toArray();
-            }
-        } else {
-            // token expired, might as well null it out so hash check fails.
-            $result->token = null;
-            $table->save($result); 
+        if (empty($result)) {
+            return false;
         }
-        return false;
+        
+        $tokenCreatedField = $this->config('tokenCreated');
+        if ($tokenCreatedField) {
+            $expiration = str_replace('+', '', $this->config('cookie.expires'));
+            if (!$result[$tokenCreatedField]->wasWithinLast($expiration)) {
+                return false;
+            }
+        }
+
+        if ($password !== null) {
+            $hasher = $this->passwordHasher();
+            $hashedPassword = $result->get($fields['password']);
+            if (!$hasher->check($password, $hashedPassword)) {
+                return false;
+            }
+
+            $this->_needsPasswordRehash = $hasher->needsRehash($hashedPassword);
+            $result->unsetProperty($fields['password']);
+        }
+
+        return $result->toArray();
     }
 
-/**
- * Called from AuthComponent::logout()
- *
- * @param array $user User record
- * @return void
- */
-    public function logout(array $user) {
+    /**
+     * Authenticate user
+     *
+     * @param Request $request Request object.
+     * @param Response $response Response object.
+     * @return array|bool Array of user info on success, false on falure.
+     */
+    public function authenticate(Request $request, Response $response)
+    {
+        return $this->getUser($request);
+    }
+
+    /**
+     * Called from AuthComponent::logout()
+     *
+     * @param \Cake\Event\Event The dispatched Auth.logout event.
+     * @return void
+     */
+    public function logout(Event $Event, $user)
+    {
         $this->_registry->Cookie->delete($this->_config['cookie']['name']);
     }
-
 }
