@@ -4,6 +4,7 @@ namespace FOC\Authenticate\Auth;
 use Cake\Auth\BaseAuthenticate;
 use Cake\Controller\ComponentRegistry;
 use Cake\Controller\Component\CookieComponent;
+use Cake\Controller\Exception\MissingComponentException;
 use Cake\Event\Event;
 use Cake\Network\Request;
 use Cake\Network\Response;
@@ -20,7 +21,9 @@ use Cake\Routing\Router;
  *            'fields' => [
  *                'username' => 'username',
  *                'password' => 'password'
+ *                'tokenCreated' => null
  *             ],
+ *            'tokenCreated' => null
  *            'userModel' => 'Users',
  *            'scope' => ['Users.active' => 1],
  *            'crypt' => 'aes',
@@ -52,9 +55,10 @@ class CookieAuthenticate extends BaseAuthenticate
         $this->config([
             'cookie' => [
                 'name' => 'RememberMe',
-                'expires' => '+2 weeks'
+                'expires' => '+2 weeks',
             ],
-            'crypt' => 'aes'
+            'crypt' => 'aes',
+            'fields' => ['tokenCreated' => null]
         ]);
 
         $this->config($config);
@@ -64,7 +68,7 @@ class CookieAuthenticate extends BaseAuthenticate
      * Authenticates the identity contained in the cookie.  Will use the
      * `userModel` config, and `fields` config to find COOKIE data that is used
      * to find a matching record in the model specified by `userModel`. Will return
-     * false if there is no cookie data, either username or password is missing,
+     * false if there is no cookie data, either identifier or token is missing,
      * or if the scope conditions have not been met.
      *
      * @param Request $request The unused request object.
@@ -76,7 +80,7 @@ class CookieAuthenticate extends BaseAuthenticate
         if (!isset($this->_registry->Cookie) ||
         !$this->_registry->Cookie instanceof CookieComponent
         ) {
-            throw new \RuntimeException('CookieComponent is not loaded');
+            throw new MissingComponentException(['class' => 'CookieComponent']);
         }
 
         $cookieConfig = $this->_config['cookie'];
@@ -90,11 +94,24 @@ class CookieAuthenticate extends BaseAuthenticate
         }
 
         extract($this->_config['fields']);
+
         if (empty($data[$username]) || empty($data[$password])) {
             return false;
         }
 
         $user = $this->_findUser($data[$username], $data[$password]);
+
+        if ($tokenCreated !== null) {
+            $expiration = str_replace('+', '', $this->config('cookie.expires'));
+            if (!$user[$tokenCreated]->wasWithinLast($expiration)) {
+                return false;
+            }
+
+            if (isset($user['password'])) {
+                unset($user['password']);
+            }
+        }
+
         if ($user) {
             $request->session()->write(
                 $this->_registry->Auth->sessionKey,
